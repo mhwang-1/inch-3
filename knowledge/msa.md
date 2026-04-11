@@ -109,6 +109,22 @@ digraph msa_pattern_selection {
 
 ---
 
+## L1 Register Target
+
+Natural Taiwanese Mandarin as spoken by an educated adult in Taipei. Translations should read like something a Taiwanese speaker would actually say in everyday conversation — not literal word-for-word glosses, not formal/literary Chinese, not Mainland-register phrasing. If a draft reads like Google Translate output, revise it.
+
+### Anti-patterns (Mandarin L1)
+
+- **的-chain pileup**: avoid more than two consecutive `的` in a single noun phrase. Restructure with a relative clause, appositive, or split sentence.
+- **所-被-由 literary passive**: do not use `所` / `被...所` / `由...所` chains unless the L2 register is explicitly formal/literary.
+- **Four-character compound stacking**: avoid piling 成語 / 四字格 to sound "literary". Plain words are usually better.
+- **Translationese copula**: do not translate every English/Malay "is" with `是` — Mandarin often drops it, or uses a different construction.
+- **Pronoun over-specification**: Mandarin drops pronouns readily; do not preserve every L2 pronoun.
+
+Consult these anti-patterns during the /inch-generate-blocks self-check step.
+
+---
+
 ## Writing System & Phonology (Quick Reference)
 
 **Script:** Rumi (Latin). Largely phonemic (one letter ≈ one sound). Jawi (Arabic-based) exists historically but is not relevant for TTS.

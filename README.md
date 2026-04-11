@@ -17,6 +17,7 @@ Personal language learning assistant operated through Claude Code and Telegram. 
   - [Chunking Strategy](#4-chunking-strategy)
   - [Response Handling](#5-response-handling)
   - [Session Timeout and Recovery](#6-session-timeout-and-recovery)
+  - [Vocab Capture and Anki Export](#7-vocab-capture-and-anki-export)
 - [Skill Commands Reference](#skill-commands-reference)
 - [Multi-Language Support](#multi-language-support)
 - [Security Model](#security-model)
@@ -46,6 +47,7 @@ Claude Code acts as the session controller. It has no persistent daemon — each
 - **`sqlite3`** — for the database. Usually pre-installed.
 - **`curl`** — used by all Telegram scripts.
 - **`uv`** — for running Python utility scripts (PEP 723 inline dependencies, no `requirements.txt` needed).
+- **Anki + AnkiConnect** *(optional)* — required only if you want to export captured vocab as flashcards. Install [Anki](https://apps.ankiweb.net/) and the [AnkiConnect](https://ankiweb.net/shared/info/2055492159) add-on (code `2055492159`).
 
 ---
 
@@ -58,6 +60,7 @@ These steps are done once per machine.
 2. /inch-setup-new-language-profile — configure a language, TTS endpoint, and voice
 3. /inch-import-books <path>        — import a book into the database
 4. /inch-continue                   — start studying
+5. /inch-connect-anki               — (optional) connect AnkiConnect for vocab export
 ```
 
 ---
@@ -75,21 +78,30 @@ inch-3/
 │       ├── inch-setup-new-language-profile.md
 │       ├── inch-connect-telegram.md
 │       ├── inch-continue.md
-│       └── inch-switch-language-profile.md
+│       ├── inch-switch-language-profile.md
+│       ├── inch-connect-anki.md
+│       ├── inch-export-anki-cards.md
+│       └── inch-prune-anki.md
 ├── knowledge/                         ← Study preferences and language references (committed).
 │   ├── preferences.md                 ← Study preferences, TTS speeds, L1 settings.
 │   ├── chunking-strategy.md           ← Language-agnostic NP/VP block-generation rules.
 │   └── {lang_code}.md                 ← Per-language grammar + chunking guide (one per language).
-├── scripts/                           ← Bash utility scripts.
+├── scripts/                           ← Bash and Python utility scripts.
 │   ├── backup-db.sh                   ← Daily DB backup; runs at session start.
 │   ├── tg-send-audio.sh               ← Send a local audio file to Telegram.
 │   ├── tg-poll-response.sh            ← Long-poll Telegram getUpdates for user reply.
-│   └── tg-send-text.sh                ← Send a text message to Telegram.
+│   ├── tg-send-text.sh                ← Send a text message to Telegram.
+│   ├── anki-export.py                 ← Export captured vocab to Anki via AnkiConnect.
+│   └── migrations/
+│       └── 0001_anki_tables.sql       ← Idempotent migration adding anki_config + anki_vocab_items.
 └── data/                              ← Runtime data. NEVER committed to git.
     ├── inch-3.db                      ← SQLite database (all study data and config).
     ├── inch-3.db-wal                  ← SQLite WAL journal.
     ├── inch-3.db-shm                  ← SQLite shared memory.
-    └── inch-3_YYYYMMDD_HHmmss.db     ← Rolling daily backups (10-day max).
+    ├── inch-3_YYYYMMDD_HHmmss.db      ← Rolling daily backups (10-day max).
+    └── anki-media/                    ← Cached TTS clips for Anki export.
+        ├── sentences/                 ← Persistent per-sentence audio cache (keyed by sentence_id).
+        └── tmp/                       ← Scratch dir for expression and merged clips (deleted after upload).
 ```
 
 ---
@@ -217,6 +229,28 @@ Context-specific timeouts:
 | Nudge re-poll | 180 s |
 | Between sentences ("ready for next?") | 300 s |
 
+### 7. Vocab Capture and Anki Export
+
+Inch 3 captures vocab automatically during study and lets you export it to Anki on demand as a lazy, user-triggered batch. Nothing leaves the DB until you ask. The pipeline has three stages:
+
+**a. Capture (automatic, during `/inch-continue`).** When you respond with **confused** or **explain** to a block, the block's expression and its L1 translation are inserted into `anki_vocab_items` alongside a pointer to the source sentence and which trigger fired. The insert is `INSERT OR IGNORE` on `(lang_profile_id, sentence_id, expression)`, so repeating the same expression in the same sentence collapses to one row. Capture is silent — it never interrupts the study loop.
+
+**b. Export (user-invoked, `/inch-export-anki-cards`).** The skill runs `scripts/anki-export.py` in two passes:
+
+1. **Dry-run preview.** Shows every pending item grouped into *will export* and *will auto-prune*. Items with `word_count(expression) ≥ 6` are considered too long to serve as atomic flashcards; they appear in the auto-prune list, get `pruned_at` set on a successful export, and never reappear.
+2. **Confirmed run.** For each exporting item, the script:
+   - Re-generates TTS for the full source sentence (cached under `data/anki-media/sentences/` keyed by `sentence_id`, so repeated exports reuse the file).
+   - Generates TTS for just the expression (into `data/anki-media/tmp/`).
+   - Merges sentence + expression into a single combined mp3.
+   - Uploads all referenced media via AnkiConnect's `storeMediaFile`, then creates the note in the target deck `Inch 3 - {lang_code}`.
+   - On success, sets `exported_at` and stores the returned Anki note ID in `anki_note_id`.
+
+   Media files are prefixed `inch3_{lang_code}_` so they cluster lexically in Anki's `collection.media`. Anki's media folder is deliberately flat — subfolders aren't supported for media that needs to render in cards — and the prefix is the only grouping the format allows.
+
+**c. Prune (user-invoked, `/inch-prune-anki`).** Pulls review stats from Anki for the active language's deck and proposes cards where **every card of the note has `interval ≥ 548 days` AND lapse rate `< 30%`**. This 1.5-year interval floor is non-negotiable. On confirmation, each approved note is deleted from Anki and its row in `anki_vocab_items` is marked `pruned_at` so it cannot re-enter the export queue.
+
+Both `exported_at IS NOT NULL` and `pruned_at IS NOT NULL` are filters in the export SELECT, so repeated export runs only ever see fresh captures.
+
 ---
 
 ## Skill Commands Reference
@@ -226,8 +260,11 @@ Context-specific timeouts:
 | `/inch-connect-telegram` | Validate bot token, detect chat ID, store Telegram config in DB. |
 | `/inch-setup-new-language-profile` | Configure language, TTS endpoint, voice, and speeds. Tests TTS before saving. Generates `knowledge/{lang_code}.md` via research + review agents. |
 | `/inch-import-books <path>` | Import epub/pdf/image-folder/text into DB, split into chapters and sentences. |
-| `/inch-continue` | Resume or start a 10-sentence study session. Delivers TTS audio via Telegram; handles `slower`, `ok`, `confused`, `explain` responses. |
+| `/inch-continue` | Resume or start a 10-sentence study session. Delivers TTS audio via Telegram; handles `slower`, `ok`, `confused`, `explain` responses. Silently captures vocab into `anki_vocab_items` on `confused`/`explain`. |
 | `/inch-switch-language-profile` | Switch the active language profile; shows optional stats; can trigger setup for an unconfigured language. |
+| `/inch-connect-anki` | Guide AnkiConnect setup (install add-on, configure host/port/API key), probe the endpoint, store config in `anki_config`. |
+| `/inch-export-anki-cards` | User-invoked only. Preview captured vocab (export list + auto-prune list), confirm, then generate TTS, merge sentence + expression audio, and create notes via AnkiConnect. Items with `word_count ≥ 6` are auto-pruned on successful export. |
+| `/inch-prune-anki` | Inspect Anki review stats for the active language's deck, list cards meeting the pruning threshold (interval ≥ 548 days, lapse rate < 30%), and soft-delete confirmed candidates from both Anki and the local DB. |
 
 ---
 
@@ -271,6 +308,8 @@ Key tables:
 | `user_knowledge_items` | Per-expression familiarity tracking: times_seen, times_confused, familiarity score. |
 | `study_sessions` | One row per session: lang_profile_id, sentences_studied, status. |
 | `sentence_study_records` | Per-sentence progress: blocks_presented, current_block_order, is_completed. |
+| `anki_config` | Singleton row (enforced by `CHECK(id=1)`) holding AnkiConnect host, port, optional API key, and an `is_active` flag set only after a successful probe. |
+| `anki_vocab_items` | One row per captured expression: source sentence, `expression`, `expression_l1`, `trigger` (`translate`/`explain`), plus lazy-export fields `exported_at`, `anki_note_id`, and `pruned_at`. |
 
 Backups are created daily by `scripts/backup-db.sh` (called at session start). A rolling 10-day maximum is enforced — the oldest backup is deleted when a new one is created and the total exceeds 10.
 
@@ -309,3 +348,9 @@ Re-run `/inch-setup-new-language-profile` and choose to regenerate `knowledge/{l
 
 **Pre-commit hook blocks a commit**
 If you see `BLOCKED: data/ files cannot be committed`, you have accidentally staged a DB or backup file. Run `git reset HEAD data/` to unstage and try again.
+
+**AnkiConnect not reachable during `/inch-export-anki-cards` or `/inch-prune-anki`**
+Make sure Anki is running, the AnkiConnect add-on is installed, and the host/port in `anki_config` match what AnkiConnect is listening on. Re-run `/inch-connect-anki` to re-probe and update the config. Scripts refuse to export if `anki_config.is_active = 0`.
+
+**`/inch-export-anki-cards` fails with `INCH_TTS_* environment variable not set`**
+The export script re-generates TTS for sentence and expression audio and requires all five env vars: `INCH_TTS_ENDPOINT`, `INCH_TTS_MODEL`, `INCH_TTS_VOICE`, `INCH_TTS_API_KEY`, `INCH_TTS_SPEED_NORMAL`. The `/inch-export-anki-cards` skill pre-caches these from the active row in `language_profiles` before invoking the script — if you run `scripts/anki-export.py` manually, you must export all five yourself.

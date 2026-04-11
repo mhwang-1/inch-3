@@ -16,6 +16,8 @@ All tables live in `data/inch-3.db` (SQLite, WAL mode). The `data/` directory is
 8. [user_knowledge_items](#8-user_knowledge_items)
 9. [study_sessions](#9-study_sessions)
 10. [sentence_study_records](#10-sentence_study_records)
+11. [anki_config](#11-anki_config)
+12. [anki_vocab_items](#12-anki_vocab_items)
 
 ---
 
@@ -204,7 +206,7 @@ One row per `/inch-continue` invocation. Records the overall status and sentence
 |--------|------|-------------|-------------|
 | `id` | INTEGER | PRIMARY KEY | Auto-increment row ID. |
 | `lang_profile_id` | INTEGER | FK → `language_profiles.id` | The active language profile during this session. |
-| `status` | TEXT | DEFAULT `'active'` | Session state: `active` (in progress), `completed` (10 sentences finished normally), `abandoned` (user quit or timeout). |
+| `status` | TEXT | DEFAULT `'active'` | Session state: `active` (in progress), `completed` (10 sentences finished normally), `abandoned` (user quit or timeout), `paused` (user said stop/pause; `ended_at` is set). |
 | `sentences_studied` | INTEGER | DEFAULT 0 | Count of sentences fully completed in this session. Updated incrementally as each sentence finishes. |
 | `started_at` | DATETIME | | Timestamp when `/inch-continue` began the session. |
 | `ended_at` | DATETIME | | Timestamp when the session ended (status changed to `completed` or `abandoned`). `NULL` while active. |
@@ -230,6 +232,61 @@ One row per sentence within a session. Tracks the delivery progress within a sin
 
 ---
 
+## 11. `anki_config`
+
+Singleton table holding the AnkiConnect connection details. The `CHECK(id=1)` constraint enforces that only one row can ever exist.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `id` | INTEGER | PRIMARY KEY, CHECK(id=1) | Always 1. Enforces singleton. |
+| `host` | TEXT | NOT NULL, DEFAULT `'127.0.0.1'` | Host where AnkiConnect listens. Loopback by default — Anki must be running on the same machine as Inch 3, or this must be changed to a reachable address. |
+| `port` | INTEGER | NOT NULL, DEFAULT `8765` | AnkiConnect HTTP port. Default is `8765` (AnkiConnect's factory default). |
+| `api_key` | TEXT | | Optional AnkiConnect API key. If set, sent as the `key` field in every request. Stored directly in the local DB — never committed to git. |
+| `is_active` | BOOLEAN | DEFAULT 0 | Set to `1` only after a successful probe (`version` + `deckNames`). Scripts refuse to export if `is_active = 0`. |
+| `configured_at` | DATETIME | | Timestamp of initial configuration. |
+| `last_verified_at` | DATETIME | | Timestamp of the last successful probe. Updated by `/inch-connect-anki` on reconfiguration. |
+
+**Notes:**
+- Created and populated by `/inch-connect-anki`.
+- Read by `scripts/anki-export.py` to build the AnkiConnect endpoint URL.
+
+---
+
+## 12. `anki_vocab_items`
+
+One row per captured expression (word or fixed expression) the user asked Claude to translate or explain during a study session. Exported to Anki lazily — see `/inch-export-anki-cards`.
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `id` | INTEGER | PRIMARY KEY | Auto-increment row ID. |
+| `lang_profile_id` | INTEGER | FK → `language_profiles.id`, NOT NULL | The language profile this vocab belongs to. Determines the target Anki deck (`Inch 3 - {lang_code}`). |
+| `sentence_id` | INTEGER | FK → `sentences.id`, NOT NULL | The sentence that contained the expression when it was captured. Used to regenerate the sentence TTS on export. |
+| `expression` | TEXT | NOT NULL | The captured expression — always equal to the `tts_text` of the block the user was asking about. No parsing, no span detection. |
+| `expression_l1` | TEXT | NOT NULL | Translation of the expression into the user's L1 — always equal to the `l1_text` of the same block. Capture is skipped if `l1_text` IS NULL. |
+| `source_block_id` | INTEGER | FK → `sentence_blocks.id` | The block the user was on when capture fired. For traceability. |
+| `trigger` | TEXT | NOT NULL, CHECK(trigger IN ('translate', 'explain')) | Which escalation step triggered the capture. |
+| `captured_at` | DATETIME | NOT NULL | When the capture fired. |
+| `exported_at` | DATETIME | | Set by `scripts/anki-export.py` after a successful `addNote`. `NULL` means the item has not been exported yet. |
+| `anki_note_id` | INTEGER | | The Anki note ID returned by AnkiConnect. Set alongside `exported_at`. Used by `/inch-prune-anki` to delete the note if the user later prunes it. |
+| `pruned_at` | DATETIME | | Set by `/inch-prune-anki` after a successful delete. Pruned rows are never re-exported. |
+
+**Constraints:**
+
+```
+UNIQUE(lang_profile_id, sentence_id, expression)
+```
+
+This is the dedup key — the same expression captured twice in the same sentence collapses to one row. The same expression in a different sentence is a separate row (different sentence audio).
+
+**Notes:**
+- Rows are created by `/inch-continue` using `INSERT OR IGNORE`.
+- Rows are exported by `scripts/anki-export.py`, invoked only via `/inch-export-anki-cards` (user-initiated; no auto-export at session end).
+- Rows are pruned (soft-deleted, `pruned_at` set) in two cases:
+  - Automatically by `scripts/anki-export.py` when `word_count(expression) >= 6` — such items are considered too long to serve as atomic Anki cards and are skipped on export.
+  - Manually by `/inch-prune-anki` once the underlying Anki cards have been mastered.
+
+---
+
 ## Indexes
 
 Beyond primary keys and UNIQUE constraints, the following indexes exist:
@@ -239,6 +296,7 @@ Beyond primary keys and UNIQUE constraints, the following indexes exist:
 | `idx_sentences_study` | `sentences` | `(lang_profile_id, study_status, book_id, chapter_id, id)` | Covers the "next unstudied sentence" query used by `/inch-generate-blocks` and `/inch-continue`. |
 | `idx_sentence_blocks_sentence` | `sentence_blocks` | `(sentence_id)` | Covers block lookups by sentence and the anti-join pattern (sentences with no blocks). |
 | `idx_uki_profile_text` | `user_knowledge_items` | `(lang_profile_id, tts_text)` UNIQUE | Enables UPSERT via `ON CONFLICT(lang_profile_id, tts_text)` and enforces one row per expression per language. |
+| `idx_anki_vocab_unexported` | `anki_vocab_items` | `(lang_profile_id, exported_at)` partial `WHERE exported_at IS NULL AND pruned_at IS NULL` | Covers the "pending export" query used by `scripts/anki-export.py` (invoked via `/inch-export-anki-cards`). |
 
 ---
 
@@ -259,7 +317,14 @@ language_profiles
   └─< user_knowledge_items (lang_profile_id)
 
 language_profiles
+  └─< anki_vocab_items (lang_profile_id)
+        └── sentences (sentence_id)
+        └── sentence_blocks (source_block_id)
+
+language_profiles
   └─< study_sessions (lang_profile_id)
         └─< sentence_study_records (session_id)
               └── sentences (sentence_id)
+
+anki_config                           (singleton, no FK)
 ```
